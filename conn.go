@@ -257,6 +257,7 @@ type Conn struct {
 
 	enableWriteCompression bool
 	compressionLevel       int
+	compressionThreshold   int
 	newCompressionWriter   func(io.WriteCloser, int) io.WriteCloser
 
 	// Read fields
@@ -766,7 +767,13 @@ func (c *Conn) WritePreparedMessage(pm *PreparedMessage) error {
 // writing the message and closing the writer.
 func (c *Conn) WriteMessage(messageType int, data []byte) error {
 
-	if c.isServer && (c.newCompressionWriter == nil || !c.enableWriteCompression) {
+	// A data message smaller than or equal to the compression threshold is
+	// sent uncompressed. The decision only compares lengths, so no extra
+	// buffer is allocated per message.
+	compress := c.newCompressionWriter != nil && c.enableWriteCompression &&
+		isData(messageType) && len(data) > c.compressionThreshold
+
+	if c.isServer && !compress {
 		// Fast path with no allocations and single frame.
 
 		var mw messageWriter
@@ -779,11 +786,16 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 		return mw.flushFrame(true, data)
 	}
 
-	w, err := c.NextWriter(messageType)
-	if err != nil {
+	var mw messageWriter
+	if err := c.beginMessage(&mw, messageType); err != nil {
 		return err
 	}
-	if _, err = w.Write(data); err != nil {
+	var w io.WriteCloser = &mw
+	if compress {
+		w = c.newCompressionWriter(&mw, c.compressionLevel)
+		mw.compress = true
+	}
+	if _, err := w.Write(data); err != nil {
 		return err
 	}
 	return w.Close()
@@ -1228,6 +1240,27 @@ func (c *Conn) SetCompressionLevel(level int) error {
 	}
 	c.compressionLevel = level
 	return nil
+}
+
+// SetCompressionThreshold sets the minimum payload size in bytes for which
+// subsequent text and binary messages are compressed. Data messages with a
+// payload smaller than or equal to threshold are sent uncompressed even when
+// compression is enabled and negotiated with the peer. A threshold of zero,
+// the default, preserves the previous behavior of compressing every data
+// message. Negative values are treated as zero. This setting is per
+// connection and does not affect how compressed and uncompressed messages
+// are read; the peer may interleave both on the same connection.
+func (c *Conn) SetCompressionThreshold(threshold int) {
+	if threshold < 0 {
+		threshold = 0
+	}
+	c.compressionThreshold = threshold
+}
+
+// CompressionThreshold returns the current minimum payload size at which
+// outgoing data messages are compressed.
+func (c *Conn) CompressionThreshold() int {
+	return c.compressionThreshold
 }
 
 // FormatCloseMessage formats closeCode and text as a WebSocket close message.

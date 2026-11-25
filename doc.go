@@ -218,6 +218,17 @@
 //
 //  conn.EnableWriteCompression(false)
 //
+// Small messages often compress poorly and can even grow in size while still
+// paying the CPU cost of compression. Use SetCompressionThreshold to skip
+// compression for data messages whose payload is at or below a size in bytes:
+//
+//  conn.SetCompressionThreshold(128)
+//
+// The threshold is per connection and defaults to zero, which compresses
+// every data message as before. Compressed and uncompressed messages can be
+// interleaved on a connection; reads transparently handle both because the
+// decision is signaled per message via the RSV1 frame bit.
+//
 // Currently this package does not support compression with "context takeover".
 // This means that messages must be compressed and decompressed in isolation,
 // without retaining sliding window or dictionary state across messages. For
