@@ -35,6 +35,7 @@ const (
 
 	defaultReadBufferSize  = 4096
 	defaultWriteBufferSize = 4096
+	defaultReadLimit       = 1 << 20 // 1 MiB
 
 	continuationFrame = 0
 	noFrame           = -1
@@ -86,7 +87,8 @@ const (
 var ErrCloseSent = errors.New("websocket: close sent")
 
 // ErrReadLimit is returned when reading a message that is larger than the
-// read limit set for the connection.
+// read limit for the connection. The limit is 1 MiB by default and can be
+// changed with SetReadLimit.
 var ErrReadLimit = errors.New("websocket: read limit exceeded")
 
 // netError satisfies the net Error interface.
@@ -315,6 +317,7 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		readLimit:              defaultReadLimit,
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -1117,9 +1120,13 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-// SetReadLimit sets the maximum size in bytes for a message read from the peer. If a
-// message exceeds the limit, the connection sends a close message to the peer
-// and returns ErrReadLimit to the application.
+// SetReadLimit sets the maximum size in bytes for a message read from the peer.
+// If a message exceeds the limit, the connection sends a close message to the
+// peer and returns ErrReadLimit to the application. The limit applies to the
+// complete message, including all continuation frames.
+//
+// The default limit is 1 MiB. A limit of zero or less disables limit
+// enforcement.
 func (c *Conn) SetReadLimit(limit int64) {
 	c.readLimit = limit
 }

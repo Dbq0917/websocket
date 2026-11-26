@@ -171,6 +171,18 @@
 // The buffer sizes do not limit the size of a message that can be read or
 // written by a connection.
 //
+// Read Limits
+//
+// By default, a connection limits the size of a message read from the peer to
+// 1 MiB. If the peer sends a larger message, including when the message is
+// fragmented across multiple frames, the connection sends a close message with
+// status 1009 and returns ErrReadLimit. Call Conn.SetReadLimit to change the
+// limit. Applications that expect larger messages must explicitly raise the
+// limit. Passing zero to SetReadLimit disables limit enforcement.
+//
+// The limit applies to the complete message and is independent of the buffer
+// size used to read the message.
+//
 // Buffers are held for the lifetime of the connection by default. If the
 // Dialer or Upgrader WriteBufferPool field is set, then a connection holds the
 // write buffer only when writing a message.

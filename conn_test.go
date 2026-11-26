@@ -590,6 +590,55 @@ func TestReadLimit(t *testing.T) {
 			t.Fatalf("read limit exceeded: limit %d, read %d", readLimit, read)
 		}
 	})
+
+	t.Run("Default ReadLimit is enforced", func(t *testing.T) {
+		message := make([]byte, defaultReadLimit+1)
+
+		var b1, b2 bytes.Buffer
+		wc := newConn(&fakeNetConn{Writer: &b1}, true, 1024, 1024, nil, nil, nil)
+		rc := newTestConn(&b1, &b2, false)
+		if rc.readLimit != defaultReadLimit {
+			t.Fatalf("default read limit = %d, want %d", rc.readLimit, defaultReadLimit)
+		}
+
+		if err := wc.WriteMessage(BinaryMessage, message); err != nil {
+			t.Fatalf("WriteMessage() returned %v", err)
+		}
+
+		if _, _, err := rc.ReadMessage(); err != ErrReadLimit {
+			t.Fatalf("ReadMessage() returned %v, want %v", err, ErrReadLimit)
+		}
+	})
+
+	t.Run("ReadLimit applies to fragmented message", func(t *testing.T) {
+		const readLimit = 512
+
+		var b1, b2 bytes.Buffer
+		// Use a small write buffer so the message is sent as several
+		// continuation frames, each smaller than the read limit.
+		wc := newConn(&fakeNetConn{Writer: &b1}, false, 1024, 64, nil, nil, nil)
+		rc := newTestConn(&b1, &b2, true)
+		rc.SetReadLimit(readLimit)
+
+		w, err := wc.NextWriter(BinaryMessage)
+		if err != nil {
+			t.Fatalf("NextWriter() returned %v", err)
+		}
+		if _, err := w.Write(make([]byte, readLimit+128)); err != nil {
+			t.Fatalf("Write() returned %v", err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close() returned %v", err)
+		}
+
+		op, r, err := rc.NextReader()
+		if op != BinaryMessage || err != nil {
+			t.Fatalf("NextReader() returned %d, %v", op, err)
+		}
+		if _, err := io.Copy(io.Discard, r); err != ErrReadLimit {
+			t.Fatalf("io.Copy() returned %v, want %v", err, ErrReadLimit)
+		}
+	})
 }
 
 func TestAddrs(t *testing.T) {
