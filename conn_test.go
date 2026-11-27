@@ -25,6 +25,13 @@ type fakeNetConn struct {
 	io.Writer
 }
 
+func (c fakeNetConn) Read(p []byte) (int, error) {
+	if c.Reader == nil {
+		return 0, io.EOF
+	}
+	return c.Reader.Read(p)
+}
+
 func (c fakeNetConn) Close() error                       { return nil }
 func (c fakeNetConn) LocalAddr() net.Addr                { return localAddr }
 func (c fakeNetConn) RemoteAddr() net.Addr               { return remoteAddr }

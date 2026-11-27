@@ -91,6 +91,14 @@
 // NextReader, ReadMessage or the message Read method. The default close
 // handler sends a close message to the peer.
 //
+// Calling Conn.Close performs the WebSocket closing handshake. Close sends a
+// close message, waits for a close message from the peer, and then closes the
+// underlying network connection. The wait is bounded by a one second timeout;
+// if the peer does not acknowledge the close before the timeout, Close returns
+// an error and closes the underlying network connection. Subsequent reads and
+// writes return an error instead of silently succeeding. Use the NetConn method
+// to close the network connection immediately without the closing handshake.
+//
 // Connections handle received ping messages by calling the handler function
 // set with the SetPingHandler method. The default ping handler sends a pong
 // message to the peer.

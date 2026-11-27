@@ -35,6 +35,7 @@ const (
 
 	defaultReadBufferSize  = 4096
 	defaultWriteBufferSize = 4096
+	defaultCloseTimeout    = time.Second
 
 	continuationFrame = 0
 	noFrame           = -1
@@ -174,6 +175,7 @@ func IsUnexpectedCloseError(err error, expectedCodes ...int) bool {
 
 var (
 	errWriteTimeout        = &netError{msg: "websocket: write timeout", timeout: true, temporary: true}
+	errCloseTimeout        = &netError{msg: "websocket: close timeout", timeout: true, temporary: true}
 	errUnexpectedEOF       = &CloseError{Code: CloseAbnormalClosure, Text: io.ErrUnexpectedEOF.Error()}
 	errBadWriteOpCode      = errors.New("websocket: bad write message type")
 	errWriteClosed         = errors.New("websocket: write closed")
@@ -279,6 +281,19 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	// Close fields. Close serializes itself with closeOnce and waits for a
+	// close frame from the peer using closeAck or a dedicated close reader.
+	readMu       sync.Mutex
+	closeOnce    sync.Once
+	closeStateMu sync.Mutex
+	closeDone    chan struct{}
+	closeAck     chan *CloseError
+	closeErr     error
+	closeReadErr error
+	closeTimeout time.Duration
+
+	closing bool
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {
@@ -315,6 +330,9 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		closeDone:              make(chan struct{}),
+		closeAck:               make(chan *CloseError, 1),
+		closeTimeout:           defaultCloseTimeout,
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -338,10 +356,151 @@ func (c *Conn) Subprotocol() string {
 	return c.subprotocol
 }
 
-// Close closes the underlying network connection without sending or waiting
-// for a close message.
+// Close performs the WebSocket closing handshake and closes the underlying
+// connection. It sends a close message, waits up to the close timeout for the
+// peer to send a close message in response, and then closes the network
+// connection. If the peer does not respond before the timeout, Close returns
+// a timeout error.
+//
+// Close is safe to call concurrently with all other methods and is
+// idempotent. Later calls return the result of the first call. Applications
+// that need to terminate the connection immediately can close the connection
+// returned by NetConn.
 func (c *Conn) Close() error {
-	return c.conn.Close()
+	c.closeOnce.Do(func() {
+		c.closeErr = c.close()
+	})
+	c.closeStateMu.Lock()
+	err := c.closeErr
+	c.closeStateMu.Unlock()
+	return err
+}
+
+type closeReadResult struct {
+	closeErr *CloseError
+	err      error
+}
+
+func (c *Conn) setClosing() {
+	c.writeErrMu.Lock()
+	c.closing = true
+	c.writeErrMu.Unlock()
+}
+
+func (c *Conn) isClosing() bool {
+	c.writeErrMu.Lock()
+	closing := c.closing
+	c.writeErrMu.Unlock()
+	return closing
+}
+
+func (c *Conn) signalCloseAck(closeErr *CloseError) {
+	select {
+	case c.closeAck <- closeErr:
+	default:
+	}
+}
+
+func (c *Conn) closeFinished() bool {
+	select {
+	case <-c.closeDone:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Conn) readCloseError() error {
+	c.closeStateMu.Lock()
+	err := c.closeReadErr
+	c.closeStateMu.Unlock()
+	return err
+}
+
+func (c *Conn) readUntilClosed() (*CloseError, error) {
+	for {
+		_, err := c.advanceFrame()
+		if err == nil {
+			continue
+		}
+		if closeErr, ok := err.(*CloseError); ok {
+			return closeErr, nil
+		}
+		return nil, err
+	}
+}
+
+func (c *Conn) close() error {
+	c.setClosing()
+
+	deadline := time.Now().Add(c.closeTimeout)
+	deadlineErr := c.conn.SetReadDeadline(deadline)
+	sendErr := c.WriteControl(CloseMessage, FormatCloseMessage(CloseNormalClosure, ""), deadline)
+	if errors.Is(sendErr, ErrCloseSent) {
+		sendErr = nil
+	}
+
+	resultCh := make(chan closeReadResult, 1)
+	go func() {
+		c.readMu.Lock()
+		defer c.readMu.Unlock()
+		closeErr, err := c.readUntilClosed()
+		resultCh <- closeReadResult{closeErr: closeErr, err: err}
+	}()
+
+	var (
+		ack     *CloseError
+		waitErr error
+	)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case ack = <-c.closeAck:
+	case result := <-resultCh:
+		if result.closeErr != nil {
+			ack = result.closeErr
+		} else {
+			waitErr = result.err
+		}
+	case <-timer.C:
+		waitErr = errCloseTimeout
+	}
+	var netErrClose net.Error
+	if errors.As(waitErr, &netErrClose) && netErrClose.Timeout() {
+		waitErr = errCloseTimeout
+	}
+
+	netErr := c.conn.Close()
+
+	cause := waitErr
+	if cause == nil {
+		cause = sendErr
+	}
+	if cause == nil {
+		cause = deadlineErr
+	}
+	if cause == nil {
+		cause = netErr
+	}
+
+	c.closeStateMu.Lock()
+	c.closeErr = cause
+	if ack != nil {
+		c.closeReadErr = ack
+	} else if waitErr != nil {
+		c.closeReadErr = waitErr
+	} else if cause != nil {
+		c.closeReadErr = cause
+	} else {
+		c.closeReadErr = errCloseTimeout
+	}
+	close(c.closeDone)
+	c.closeStateMu.Unlock()
+
+	if errors.Is(cause, errCloseTimeout) {
+		return errCloseTimeout
+	}
+	return cause
 }
 
 // LocalAddr returns the local network address.
@@ -382,9 +541,13 @@ func (c *Conn) write(frameType int, deadline time.Time, buf0, buf1 []byte) error
 
 	c.writeErrMu.Lock()
 	err := c.writeErr
+	closing := c.closing
 	c.writeErrMu.Unlock()
 	if err != nil {
 		return err
+	}
+	if closing {
+		return ErrCloseSent
 	}
 
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {
@@ -418,6 +581,9 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 	}
 	if len(data) > maxControlFramePayloadSize {
 		return errInvalidControlFrame
+	}
+	if messageType != CloseMessage && c.isClosing() {
+		return ErrCloseSent
 	}
 
 	b0 := byte(messageType) | finalBit
@@ -463,9 +629,13 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 
 	c.writeErrMu.Lock()
 	err := c.writeErr
+	closing := c.closing
 	c.writeErrMu.Unlock()
 	if err != nil {
 		return err
+	}
+	if closing && messageType != CloseMessage {
+		return ErrCloseSent
 	}
 
 	if err := c.conn.SetWriteDeadline(deadline); err != nil {
@@ -496,9 +666,13 @@ func (c *Conn) beginMessage(mw *messageWriter, messageType int) error {
 
 	c.writeErrMu.Lock()
 	err := c.writeErr
+	closing := c.closing
 	c.writeErrMu.Unlock()
 	if err != nil {
 		return err
+	}
+	if closing {
+		return ErrCloseSent
 	}
 
 	mw.c = c
@@ -980,7 +1154,9 @@ func (c *Conn) advanceFrame() (int, error) {
 		if err := c.handleClose(closeCode, closeText); err != nil {
 			return noFrame, err
 		}
-		return noFrame, &CloseError{Code: closeCode, Text: closeText}
+		closeErr := &CloseError{Code: closeCode, Text: closeText}
+		c.signalCloseAck(closeErr)
+		return noFrame, closeErr
 	}
 
 	return frameType, nil
@@ -1007,6 +1183,17 @@ func (c *Conn) handleProtocolError(message string) error {
 // permanent. Once this method returns a non-nil error, all subsequent calls to
 // this method return the same error.
 func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
+	if c.closeFinished() {
+		return noFrame, nil, c.readCloseError()
+	}
+
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	if c.closeFinished() {
+		return noFrame, nil, c.readCloseError()
+	}
+
 	// Close previous reader, only relevant for decompression.
 	if c.reader != nil {
 		c.reader.Close()
@@ -1048,6 +1235,17 @@ type messageReader struct{ c *Conn }
 
 func (r *messageReader) Read(b []byte) (int, error) {
 	c := r.c
+	if c.closeFinished() {
+		return 0, c.readCloseError()
+	}
+
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	if c.closeFinished() {
+		return 0, c.readCloseError()
+	}
+
 	if c.messageReader != r {
 		return 0, io.EOF
 	}
